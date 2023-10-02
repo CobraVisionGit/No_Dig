@@ -22,7 +22,7 @@ class PointCloudVisualizer():
         self.vis = o3d.visualization.Visualizer()
         self.vis.create_window(window_name="Point Cloud")
         self.vis.add_geometry(self.pcl)
-        origin = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.5, origin=[0, 0, 0])
+        origin = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2.5, origin=[-.75, -.75, -4])
         self.vis.add_geometry(origin)
         view_control = self.vis.get_view_control()
         view_control.set_constant_z_far(1000)
@@ -32,8 +32,11 @@ class PointCloudVisualizer():
         rgb_o3d = o3d.geometry.Image(rgb)
         depth_o3d = o3d.geometry.Image(depth_map)
 
+        # rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
+        #     rgb_o3d, depth_o3d, convert_rgb_to_intensity=(len(rgb.shape) != 3), depth_trunc=20000, depth_scale=1000.0
+        # )
         rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            rgb_o3d, depth_o3d, convert_rgb_to_intensity=(len(rgb.shape) != 3), depth_trunc=20000, depth_scale=1000.0
+            rgb_o3d, depth_o3d, convert_rgb_to_intensity=(len(rgb.shape) != 3), depth_trunc=200, depth_scale=1000.0
         )
 
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, self.pinhole_camera_intrinsic)
@@ -58,15 +61,12 @@ class PointCloudVisualizer():
         self.vis.destroy_window()
 
     def set_orientation(self, pitch, roll):
-        # Initial rotation to align y-axis with up direction
-        initial_rotation = Rotation.from_euler('z', -np.pi / 2, degrees=False)
-
         # Convert pitch and roll to a rotation matrix
         rotation_pitch = Rotation.from_euler('x', pitch, degrees=False)
         rotation_roll = Rotation.from_euler('y', roll, degrees=False)
 
         # Combine the rotations
-        rotation = initial_rotation * rotation_pitch * rotation_roll
+        rotation = rotation_pitch * rotation_roll
         rotation_matrix = rotation.as_matrix()
 
         # Update the rotation matrix for the point cloud
@@ -76,4 +76,5 @@ class PointCloudVisualizer():
         self.pcl.rotate(self.R_camera_to_world, center=np.array([0, 0, 0], dtype=np.float64))
 
         return self.R_camera_to_world
+
 
