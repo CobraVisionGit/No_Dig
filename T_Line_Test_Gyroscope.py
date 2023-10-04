@@ -238,28 +238,65 @@ class Detector:
 
                 if center_xy_TL is not None and center_xy_TR is not None and center_xy_TB is not None:
                     # Get the height of the T detection
+                    t1 = time.time()
                     frame = self.draw_no_dig(frame, center_xy_TL, center_xy_TR, center_xy_TB, depth_frame)
+                    t2 = time.time()
+                    print(f"draw_no_dig Time: {round((t2-t1)*1000)} ms!")
 
         return frame
 
-    def set_orientation(self, R_camera_to_world):
-
-        # Update the rotation matrix for the point cloud
-        self.R_camera_to_world = R_camera_to_world
-
     def draw_no_dig(self, frame, center_xy_TL, center_xy_TR, center_xy_TB, depth_frame):
         # Extracting the intrinsic parameters from self.intrinsics
-        fx, fy = self.intrinsics[0][0], self.intrinsics[1][1]
-        cx, cy = self.intrinsics[0][2], self.intrinsics[1][2]
+        self.intrinsics = np.array(self.intrinsics)
+        fx, fy = self.intrinsics[0, 0], self.intrinsics[1, 1]
+        cx, cy = self.intrinsics[0, 2], self.intrinsics[1, 2]
 
         # Convert height tolerance to millimeters
-        height_tolerance = 1 * 0.3048 * 1000  # 0.5 feet to mm
+        # height_tolerance = 0.8 * 0.3048 * 1000  # 0.5 feet to mm
+        height_tolerance_1 = 0.2 * 0.3048 * 1000  # 0.8 feet to mm
+        height_tolerance_2 = 0.8 * 0.3048 * 1000  # 1.0 feet to mm
 
         # Getting the dimensions of the frame
         h, w = frame.shape[:2]
 
+        # Convert data to PyTorch tensors and move to GPU
+        depth_frame_t = torch.tensor(depth_frame.astype(np.float32), device=self.device)
+
+        # Convert other data to tensors
+        center_xy_TL_t = torch.tensor(center_xy_TL, device=self.device, dtype=torch.float32)
+        center_xy_TR_t = torch.tensor(center_xy_TR, device=self.device, dtype=torch.float32)
+        center_xy_TB_t = torch.tensor(center_xy_TB, device=self.device, dtype=torch.float32)
+
+        # Function to convert image coordinates and depth to spatial coordinates
+        def to_spatial(u, v, Z):
+            X_cam = (u - cx) * Z / fx
+            Y_cam = (v - cy) * Z / fy
+            Z_cam = Z
+            return torch.tensor([X_cam, Y_cam, Z_cam], device=self.device)
+
+        # Compute the spatial coordinates of the T mark
+        coords_TL = to_spatial(*center_xy_TL_t, depth_frame_t[center_xy_TL_t[1].long(), center_xy_TL_t[0].long()])
+        coords_TR = to_spatial(*center_xy_TR_t, depth_frame_t[center_xy_TR_t[1].long(), center_xy_TR_t[0].long()])
+        coords_TB = to_spatial(*center_xy_TB_t, depth_frame_t[center_xy_TB_t[1].long(), center_xy_TB_t[0].long()])
+
+        # Compute two vectors lying in the plane
+        vector1 = coords_TR - coords_TL
+        vector2 = coords_TB - coords_TL
+
+        # Compute the normal to the plane
+        normal = torch.cross(vector1, vector2)
+        normal = normal / torch.linalg.norm(normal)  # Normalize the normal
+
+        # Project the coordinates of the T mark onto the normal to get the height along the zed axis
+        zed_TL = torch.dot(coords_TL, normal)
+        zed_TR = torch.dot(coords_TR, normal)
+        zed_TB = torch.dot(coords_TB, normal)
+        avg_height = torch.mean(torch.tensor([zed_TL, zed_TR, zed_TB], device=self.device))  # Now using the projection onto the normal
+
         # Create an empty mask
-        mask = np.zeros((h, w, 4), dtype=np.uint8)
+        # mask = torch.zeros((h, w, 4), device=self.device, dtype=torch.uint8)
+        mask_1 = torch.zeros((h, w, 4), device=self.device, dtype=torch.uint8)
+        mask_2 = torch.zeros((h, w, 4), device=self.device, dtype=torch.uint8)
 
         # Calculate the slope (m) and y-intercept (b) of the line
         x1, y1 = center_xy_TL
@@ -271,50 +308,70 @@ class Detector:
         x, y = center_xy_TB
         if m is not None:
             line_y = m * x + b
-            above_line = y < line_y
+            above_line = y > line_y
         else:
-            above_line = x < x1  # For vertical line
+            above_line = x > x1  # For vertical line
 
-        # Function to convert image coordinates and depth to spatial coordinates
-        def to_spatial(u, v, Z):
-            X_cam = (u - cx) * Z / fx
-            Y_cam = (v - cy) * Z / fy
-            Z_cam = Z
-            coords_cam = np.array([X_cam, Y_cam, Z_cam])
-            coords_world = self.R_camera_to_world @ coords_cam
-            return coords_world
+        # Create coordinate grids
+        u, v = torch.meshgrid(torch.arange(w, device=self.device), torch.arange(h, device=self.device))
+        Z = depth_frame_t[v, u]
 
-        # Compute the spatial coordinates of the T mark
-        coords_TL = to_spatial(*center_xy_TL, depth_frame[center_xy_TL[1], center_xy_TL[0]])
-        coords_TR = to_spatial(*center_xy_TR, depth_frame[center_xy_TR[1], center_xy_TR[0]])
-        coords_TB = to_spatial(*center_xy_TB, depth_frame[center_xy_TB[1], center_xy_TB[0]])
-        avg_height = np.mean([coords_TL[1], coords_TR[1], coords_TB[1]])  # Assuming Y is the height axis
+        # Convert image coordinates to spatial coordinates
+        X_cam = (u - cx) * Z / fx
+        Y_cam = (v - cy) * Z / fy
+        Z_cam = Z
 
-        # Iterate through each pixel in the depth frame
-        for v in range(h):
-            for u in range(w):
-                # Get the depth value
-                Z = depth_frame[v, u]
+        # Stack coordinates
+        coords = torch.stack((X_cam, Y_cam, Z_cam), dim=-1)
 
-                # Get the depth value
-                coords = to_spatial(u, v, Z)
-                Y = coords[1]  # Assuming Y is the height axis
+        # Project the coordinates onto the normal to get the height along the zed axis
+        zed = torch.sum(coords * normal, dim=-1)
 
-                # Check if the Y coordinate (height) is within the desired height range
-                within_height_range = avg_height - height_tolerance <= Y <= avg_height + height_tolerance
+        # Check if the zed coordinate (height) is within the desired height range
+        # within_height_range = (avg_height - height_tolerance <= zed) & (zed <= avg_height + height_tolerance)
+        within_height_range_1 = (avg_height - height_tolerance_1 <= zed) & (zed <= avg_height + height_tolerance_1)
+        within_height_range_2 = (avg_height - height_tolerance_2 <= zed) & (zed <= avg_height + height_tolerance_2)
 
-                # Check if the pixel is on the desired side of the line
-                if m is not None:
-                    on_desired_side = (above_line and v > m * u + b) or (not above_line and v < m * u + b)
-                else:
-                    on_desired_side = (above_line and u > x1) or (not above_line and u < x1)
+        # Check if the pixel is on the desired side of the line
+        if m is not None:
+            on_desired_side = (above_line & (v > m * u + b)) | (~above_line & (v < m * u + b))
+        else:
+            on_desired_side = (above_line & (u > x1)) | (~above_line & (u < x1))
 
-                # If both conditions are met, mark the pixel on the mask
-                if within_height_range and on_desired_side:
-                    mask[v, u] = (0, 0, 255, 100)  # Red color, 100 = 40% transparency
+        # Ensure the conditions are boolean
+        within_height_range_1 = within_height_range_1.bool()
+        on_desired_side = on_desired_side.bool()
 
-        # Blend the mask with the original image
-        image = cv2.addWeighted(frame, 1, mask[:, :, :3], 0.5, 0)
+        # Combine the conditions
+        # condition = within_height_range & on_desired_side
+        condition_1 = within_height_range_1 & on_desired_side
+        condition_2 = within_height_range_2 & on_desired_side
+
+        # Transpose the condition tensor to match the dimensions of the mask tensor
+        condition_1 = condition_1.t()
+        condition_2 = condition_2.t()
+        # print(f"condition: {condition}")
+
+        # Expand the dimensions of the condition tensor to match the mask tensor
+        condition_1_expanded = condition_1.unsqueeze(-1).expand_as(mask_1)
+        condition_2_expanded = condition_2.unsqueeze(-1).expand_as(mask_2)
+
+        # Set the mask values based on the condition
+        color_tensor_1 = torch.tensor([0, 0, 255, 50], device=self.device, dtype=torch.uint8)
+        color_tensor_2 = torch.tensor([0, 0, 255, 50], device=self.device, dtype=torch.uint8)
+        # mask = torch.where(condition_expanded, color_tensor, mask)
+        mask_1 = torch.where(condition_1_expanded, color_tensor_1, mask_1)
+
+        # Set the mask values based on the condition for height_tolerance_1
+        mask_2 = torch.where(condition_2_expanded, color_tensor_2, mask_1)
+
+        # When you need to convert a tensor back to a NumPy array, first move it to the CPU
+        mask_1_np = mask_1.cpu().numpy()
+        mask_2_np = mask_2.cpu().numpy()
+
+        # Blend the masks with the original image
+        image = cv2.addWeighted(frame, 1, mask_1_np[:, :, :3], 0.5, 0)
+        image = cv2.addWeighted(image, 1, mask_2_np[:, :, :3], 0.5, 0)
 
         return image
 
@@ -341,7 +398,7 @@ xlink_out_imu = pipeline.create(dai.node.XLinkOut)
 xlink_out_imu.setStreamName('imu')
 
 # Enable ACCELEROMETER_RAW and GYROSCOPE_RAW at 100 Hz rate
-imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 100)
+imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 25)
 # Set batch report settings
 imu.setBatchReportThreshold(1)
 imu.setMaxBatchReports(10)
@@ -376,7 +433,7 @@ config.postProcessing.spatialFilter.enable = True
 config.postProcessing.spatialFilter.holeFillingRadius = 2
 config.postProcessing.spatialFilter.numIterations = 1
 config.postProcessing.thresholdFilter.minRange = 200 # Default 400
-config.postProcessing.thresholdFilter.maxRange = 2000000 # Default 200000
+config.postProcessing.thresholdFilter.maxRange = 50000 # Default 200000
 config.postProcessing.decimationFilter.decimationFactor = 1
 stereo.initialConfig.set(config)
 
@@ -413,6 +470,8 @@ stereo.rectifiedRight.link(xout_rect_right.input)
 class HostSync:
     def __init__(self):
         self.arrays = {}
+        self.last_time = None
+        self.cumulative_yaw = 0.0
 
     def add_msg(self, name, msg):
         if not name in self.arrays:
@@ -440,11 +499,101 @@ class HostSync:
         return False
 
     def adjust_orientation(self, accel_data, gyro_data):
-        # This is a simplified example. In reality, you would use a more advanced
-        # sensor fusion algorithm to calculate orientation.
+        # Normalize accelerometer data
+        ax, ay, az = accel_data.z, accel_data.y, accel_data.x
+        norm = np.sqrt(ax * ax + ay * ay + az * az)
+        ax /= norm
+        ay /= norm
+        az /= norm
+
+        # Calculate pitch and roll based on accelerometer data
+        # pitch = np.arctan2(accel_data.z, accel_data.x) # This also might work
+        pitch = np.arctan2(ax, az)
+        # pitch = np.degrees(pitch)
+        # roll = np.arctan2(-accel_data.y, np.sqrt(accel_data.x ** 2 + accel_data.z ** 2))
+        roll = -np.arctan2(ay, az)
+        # roll = np.degrees(roll)
+
+
+        # Calculate yaw using gyroscope data
+        if self.last_time is not None:
+            time_now = time.time()
+            time_delta = time_now - self.last_time
+            yaw_rate = -gyro_data.x  # Assuming gyro_data.z provides the rate of change of yaw
+            yaw_change = yaw_rate * time_delta
+            self.cumulative_yaw += yaw_change
+        else:
+            time_now = time.time()
+
+        self.last_time = time_now
+
+        # Convert the pitch, roll, and yaw to a rotation matrix
+        rotation = Rotation.from_euler('xyz', [pitch, self.cumulative_yaw, roll])
+        # rotation = Rotation.from_euler('xz', [pitch, roll])
+        rotation_matrix = rotation.as_matrix()
+
+        # Convert the 3x3 rotation matrix to a 4x4 transformation matrix
+        transformation_matrix = np.eye(4)
+        transformation_matrix[:3, :3] = rotation_matrix
+
+        return transformation_matrix, rotation_matrix
+
+    def adjust_orientation_HELP(self, accel_data, gyro_data):
+        # Corrected roll and pitch calculations
+        roll = np.arctan2(accel_data.x, np.sqrt(accel_data.y ** 2 + accel_data.z ** 2))
         pitch = np.arctan2(accel_data.y, accel_data.z)
-        roll = np.arctan2(-accel_data.x, np.sqrt(accel_data.y ** 2 + accel_data.z ** 2))
-        return pitch, roll
+
+        # Handle gimbal lock when camera is below the horizon
+        if accel_data.z < 0:  # Assuming positive x is pointing upwards
+            print("HERE")
+            roll = np.pi - roll  # Adjust roll
+
+        # pitch = np.sign(pitch) * np.pi - pitch  # Adjust pitch
+
+        # Convert roll and pitch to quaternion
+        q = self.euler_to_quaternion(roll, pitch, 0)
+
+        # Convert quaternion to rotation matrix
+        R = self.quaternion_to_matrix(q)
+
+        # Apply a static rotation to correct the initial orientation
+        if accel_data.z < 0:
+            y_rotation_180 = np.array([
+                [-1, 0, 0],
+                [0, 1, 0],
+                [0, 0, -1]
+            ])
+            R = np.dot(y_rotation_180, R)
+
+        # Return combined transformation matrix
+        transformation_matrix = np.eye(4)
+        transformation_matrix[:3, :3] = R
+        return transformation_matrix
+
+    def euler_to_quaternion(self, roll, pitch, yaw):
+        cy = np.cos(yaw * 0.5)
+        sy = np.sin(yaw * 0.5)
+        cr = np.cos(roll * 0.5)
+        sr = np.sin(roll * 0.5)
+        cp = np.cos(pitch * 0.5)
+        sp = np.sin(pitch * 0.5)
+
+        qw = cy * cr * cp + sy * sr * sp
+        qx = cy * sr * cp - sy * cr * sp
+        qy = cy * cr * sp + sy * sr * cp
+        qz = sy * cr * cp - cy * sr * sp
+
+        return [qw, qx, qy, qz]
+
+    def quaternion_to_matrix(self, q):
+        qw, qx, qy, qz = q
+        R = np.array([
+            [1 - 2 * qy ** 2 - 2 * qz ** 2, 2 * qx * qy - 2 * qz * qw, 2 * qx * qz + 2 * qy * qw],
+            [2 * qx * qy + 2 * qz * qw, 1 - 2 * qx ** 2 - 2 * qz ** 2, 2 * qy * qz - 2 * qx * qw],
+            [2 * qx * qz - 2 * qy * qw, 2 * qy * qz + 2 * qx * qw, 1 - 2 * qx ** 2 - 2 * qy ** 2]
+        ])
+        return R
+
 
 detector = Detector()
 detector.setup_YOLOv7()
@@ -460,7 +609,8 @@ with dai.Device(pipeline) as device:
     imu_queue = device.getOutputQueue("imu", maxSize=10, blocking=False)  # Create output queue for IMU data
 
     try:
-        from projector_3d import PointCloudVisualizer
+        # from projector_3d import PointCloudVisualizer
+        from projector_3d_join_gyroscope_version import PointCloudVisualizer
     except ImportError as e:
         raise ImportError(
             f"\033[1;5;31mError occured when importing PCL projector: {e}. Try disabling the point cloud \033[0m ")
@@ -475,6 +625,9 @@ with dai.Device(pipeline) as device:
         w, h = monoRight.getResolutionSize()
         intrinsics = calibData.getCameraIntrinsics(dai.CameraBoardSocket.RIGHT, dai.Size2f(w, h))
     pcl_converter = PointCloudVisualizer(intrinsics, w, h)
+
+    # w, h = monoRight.getResolutionSize()
+    # intrinsics = calibData.getCameraIntrinsics(dai.CameraBoardSocket.RIGHT, dai.Size2f(w, h))
 
     detector.set_intrinsics(intrinsics)
 
@@ -491,23 +644,23 @@ with dai.Device(pipeline) as device:
                 gyro_data = packet.gyroscope
 
                 # Calculate orientation
-                pitch, roll = sync.adjust_orientation(accel_data, gyro_data)
+                transformation_matrix, rotation_matrix = sync.adjust_orientation(accel_data, gyro_data)
 
                 # Adjust visualization orientation
-                R_camera_to_world = pcl_converter.set_orientation(pitch, roll)
+                # R_camera_to_world = pcl_converter.set_orientation(pitch, roll)
 
         for q in qs:
             new_msg = q.tryGet()
             if new_msg is not None:
                 msgs = sync.add_msg(q.getName(), new_msg)
                 if msgs:
+                    print(msgs.keys())
                     depth = msgs["depth"].getFrame()
                     color = msgs["colorize"].getCvFrame()
 
                     input_frames = color.copy()
                     batch_tensor = detector.preprocess_frame_YOLOv7(input_frames)
                     coordinates, scores, class_indexes, inference_time = detector.detect_YOLOv7(batch_tensor)
-                    detector.set_orientation(R_camera_to_world)
                     color = detector.annotate_results(input_frames, coordinates, class_indexes, depth)
 
 
@@ -521,7 +674,7 @@ with dai.Device(pipeline) as device:
                     cv2.imshow("rectified_left", rectified_left)
                     cv2.imshow("rectified_right", rectified_right)
                     rgb = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
-                    pcl_converter.rgbd_to_projection(depth, rgb)
+                    pcl_converter.rgbd_to_projection(depth, rgb, transformation_matrix)
                     pcl_converter.visualize_pcd()
 
         key = cv2.waitKey(1)

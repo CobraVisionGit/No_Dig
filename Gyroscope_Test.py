@@ -1,37 +1,34 @@
 import depthai as dai
+import numpy as np
+
 
 # Create a pipeline
 pipeline = dai.Pipeline()
-imu = pipeline.create(dai.node.IMU)
-xlink_out = pipeline.create(dai.node.XLinkOut)
 
-# Set xlink output stream name
-xlink_out.setStreamName('imu')
+# Create an IMU node
+imu_node = pipeline.createIMU()
+imu_node.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 400)  # 400 Hz sample rate
 
-# Enable ACCELEROMETER_RAW and GYROSCOPE_RAW at 100 Hz rate
-imu.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 100)
-# Set batch report settings
-imu.setBatchReportThreshold(1)
-imu.setMaxBatchReports(10)
+# Initialize the device with the created pipeline
+device = dai.Device(pipeline)
 
-# Link IMU node to XLinkOut node
-imu.out.link(xlink_out.input)
+# Create an IMU queue
+imu_queue = device.getOutputQueue(name="imu", maxSize=8, blocking=False)
 
-# Create device and start a pipeline
-with dai.Device(pipeline) as device:
-    # Get output queue
-    imu_queue = device.getOutputQueue(name='imu', maxSize=10, blocking=False)
-
+def get_accel_data():
     while True:
-        # Get IMU data
-        imu_data = imu_queue.get()  # Blocking call, will wait until a new data has arrived
-        # Now imu_data contains the IMU data, which you can access with imu_data.packets
+        imu_data = imu_queue.get()  # Get IMU packet
+        for imu_packet in imu_data.packets:
+            accel_data = imu_packet.acceleroMeter
+            if accel_data:  # If accelerometer data is available
+                return accel_data
 
-        for packet in imu_data.packets:
-            accel_data = packet.acceleroMeter
-            gyro_data = packet.gyroscope
+def compute_roll_pitch(accel_data):
+    roll = np.arctan2(accel_data.y, np.sqrt(accel_data.x**2 + accel_data.z**2))
+    pitch = np.arctan2(-accel_data.x, np.sqrt(accel_data.y**2 + accel_data.z**2))
+    return roll, pitch
 
-            # Now accel_data and gyro_data contain the accelerometer and gyroscope data respectively
-            # They are in the format of dai.IMUReport - you can access the data with accel_data.x, accel_data.y, accel_data.z, etc.
-            print(f"Accelerometer: {accel_data.x}, {accel_data.y}, {accel_data.z}")
-            print(f"Gyroscope: {gyro_data.x}, {gyro_data.y}, {gyro_data.z}")
+if __name__ == "__main__":
+    accel_data = get_accel_data()
+    roll, pitch = compute_roll_pitch(accel_data)
+    print(f"Roll: {np.degrees(roll)} degrees, Pitch: {np.degrees(pitch)} degrees")
