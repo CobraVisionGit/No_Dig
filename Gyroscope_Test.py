@@ -1,34 +1,56 @@
-import depthai as dai
-import numpy as np
+import websocket
+import threading
+import time
 
+def on_message_accel(ws, message):
+    print("Accelerometer: " + message)  # sensor data here in JSON format
+    # time.sleep(1)
 
-# Create a pipeline
-pipeline = dai.Pipeline()
+def on_message_gyro(ws, message):
+    print("Gyroscope: " + message)  # sensor data here in JSON format
+    time.sleep(1000)
 
-# Create an IMU node
-imu_node = pipeline.createIMU()
-imu_node.enableIMUSensor([dai.IMUSensor.ACCELEROMETER_RAW, dai.IMUSensor.GYROSCOPE_RAW], 400)  # 400 Hz sample rate
+def on_error(ws, error):
+    print("### error ###")
+    print(error)
 
-# Initialize the device with the created pipeline
-device = dai.Device(pipeline)
+def on_close(ws, close_code, reason):
+    print("### closed ###")
+    print("close code : ", close_code)
+    print("reason : ", reason)
 
-# Create an IMU queue
-imu_queue = device.getOutputQueue(name="imu", maxSize=8, blocking=False)
+def on_open(ws):
+    print("connection opened")
 
-def get_accel_data():
-    while True:
-        imu_data = imu_queue.get()  # Get IMU packet
-        for imu_packet in imu_data.packets:
-            accel_data = imu_packet.acceleroMeter
-            if accel_data:  # If accelerometer data is available
-                return accel_data
+def run_accelerometer_websocket():
+    ws = websocket.WebSocketApp(
+        "ws://192.168.0.194:8080/sensor/connect?type=android.sensor.accelerometer",
+        on_open=on_open,
+        on_message=on_message_accel,  # Updated to the new callback function
+        on_error=on_error,
+        on_close=on_close
+    )
+    ws.run_forever()
 
-def compute_roll_pitch(accel_data):
-    roll = np.arctan2(accel_data.y, np.sqrt(accel_data.x**2 + accel_data.z**2))
-    pitch = np.arctan2(-accel_data.x, np.sqrt(accel_data.y**2 + accel_data.z**2))
-    return roll, pitch
+def run_gyroscope_websocket():
+    gs = websocket.WebSocketApp(
+        "ws://192.168.0.194:8080/sensor/connect?type=android.sensor.gyroscope",
+        on_open=on_open,
+        on_message=on_message_gyro,  # Updated to the new callback function
+        on_error=on_error,
+        on_close=on_close
+    )
+    gs.run_forever()
 
 if __name__ == "__main__":
-    accel_data = get_accel_data()
-    roll, pitch = compute_roll_pitch(accel_data)
-    print(f"Roll: {np.degrees(roll)} degrees, Pitch: {np.degrees(pitch)} degrees")
+    # Start a new thread for the accelerometer websocket
+    accelerometer_thread = threading.Thread(target=run_accelerometer_websocket)
+    accelerometer_thread.start()
+
+    # Start a new thread for the gyroscope websocket
+    gyroscope_thread = threading.Thread(target=run_gyroscope_websocket)
+    gyroscope_thread.start()
+
+    # Optionally wait for both threads to finish (this will block indefinitely in this case)
+    accelerometer_thread.join()
+    gyroscope_thread.join()
